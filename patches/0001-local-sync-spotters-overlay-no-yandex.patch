@@ -1,0 +1,115 @@
+diff --git a/scripts/equasar_server.py b/scripts/equasar_server.py
+index e1d48c7..29de10f 100755
+--- a/scripts/equasar_server.py
++++ b/scripts/equasar_server.py
+@@ -262,7 +262,7 @@ MODE_DOWNGRADE = False
+ BUILD = "V7-LOCAL-SYNC"
+ MODE_PASSTHROUGH = False   # всё прозрачно в настоящий Яндекс (диагностика)
+ MODE_OTA_ONLY = False      # только прошивка: /check_updates + zip, остальное — в Яндекс (Mini)
+-SYNC_LOCAL = os.environ.get("SYNC_LOCAL") == "1"   # аварийно: отдавать локальный шаблон вместо Яндекса
++SYNC_LOCAL = os.environ.get("SYNC_LOCAL", "1") != "0"   # по умолчанию локальный шаблон; Яндекс не спрашиваем (запрет владельца)
+ # повторы при 429/5xx: сколько всего попыток и пауза между ними
+ RETRY_ATTEMPTS = max(1, int(os.environ.get("SYNC_RETRIES", "3")))
+ RETRY_DELAY = max(0.0, float(os.environ.get("SYNC_RETRY_DELAY", "2.5")))
+@@ -402,6 +402,64 @@ def _inject_unbound(d):
+             params.append(line)
+     return d
+ 
++def _inject_spotters(d):
++    """Локальные команды колонки без фразы «Алиса»: «включи свет», «тише», «дальше».
++
++    Группы командных споттеров и always-on микрофон: колонка хранит их в
++    user_config.dat и перезаписывает при каждой синхронизации тем, что пришло
++    отсюда, поэтому включать надо в ответе sync, а не на колонке.
++    """
++    acc = d.setdefault("config", {}).setdefault("account_config", {})
++    groups = {
++        "call": ("answer",),
++        "music": ("bluetooth", "feedback", "navigation", "playAndPause", "volume"),
++        "smartHome": ("light", "tv"),
++        "tv": ("backToHome", "navigation"),
++    }
++    spotters = acc.setdefault("enabledCommandSpotters", {})
++    for group, names in groups.items():
++        section = spotters.setdefault(group, {})
++        for name in names:
++            section[name] = True
++    acc["alwaysOnMicForShortcuts"] = True
++    return d
++
++
++# Пользовательские настройки колонки из дашборда (sparse {account_config:{}, device_config:{}}).
++# Читается при каждом запросе; любая ошибка — отдаём ответ как раньше, без наложения.
++SYNC_OVERLAY = os.environ.get("AISIS_SYNC_OVERLAY") or os.path.join(
++    os.path.expanduser("~"), ".config", "aisis-yandex", "speaker-sync-overlay.json")
++_OVERLAY_SECTIONS = ("account_config", "device_config")
++_OVERLAY_SKIP = {"account_config": ("enabledCommandSpotters",)}   # локальные команды владельца не трогаем
++
++
++def _overlay_merge(base, patch, skip=()):
++    for k, v in patch.items():
++        if k in skip:
++            continue
++        if isinstance(v, dict) and isinstance(base.get(k), dict):
++            _overlay_merge(base[k], v)
++        else:
++            base[k] = v
++
++
++def _apply_overlay(d):
++    """Накладывает overlay ПОСЛЕ инъекций (alwaysOnMicForShortcuts можно изменить, enabledCommandSpotters — нет)."""
++    try:
++        with open(SYNC_OVERLAY, encoding="utf-8") as fh:
++            ov = json.load(fh)
++        if not isinstance(ov, dict):
++            return d
++        out = json.loads(json.dumps(d))
++        cfg = out.setdefault("config", {})
++        for sec in _OVERLAY_SECTIONS:
++            patch = ov.get(sec)
++            if isinstance(patch, dict) and patch:
++                _overlay_merge(cfg.setdefault(sec, {}), patch, _OVERLAY_SKIP.get(sec, ()))
++        return out
++    except Exception:
++        return d
++
+ 
+ def sync_payload(source=None, platform=None):
+     """Ответ /get_sync_info со включённым ADB.
+@@ -411,7 +469,7 @@ def sync_payload(source=None, platform=None):
+     """
+     if source is not None:
+         d = json.loads(json.dumps(source))       # копия, оригинал не портим
+-        return json.dumps(_inject_unbound(_inject_adbd(d, platform)), ensure_ascii=False).encode()
++        return json.dumps(_apply_overlay(_inject_unbound(_inject_spotters(_inject_adbd(d, platform)))), ensure_ascii=False).encode()
+     if not _TEMPLATE["loaded"]:
+         _TEMPLATE["data"] = _load_template()
+         _TEMPLATE["loaded"] = True
+@@ -420,7 +478,7 @@ def sync_payload(source=None, platform=None):
+         d = json.loads(SYNC_INFO_PAYLOAD.decode())
+     else:
+         d = json.loads(json.dumps(base))        # копия
+-    return json.dumps(_inject_unbound(_inject_adbd(d, platform)), ensure_ascii=False).encode()
++    return json.dumps(_apply_overlay(_inject_unbound(_inject_spotters(_inject_adbd(d, platform)))), ensure_ascii=False).encode()
+ 
+ 
+ OK_PAYLOAD = b'{"status":"ok"}'
+@@ -669,6 +727,9 @@ class EquasarHandler(http.server.BaseHTTPRequestHandler):
+ 
+     def _upstream(self, host, ip, body, hdrs):
+         """Запрос в Яндекс с повторами на 429/5xx: 3 попытки, пауза 2.5с по умолчанию."""
++        # Строгий запрет владельца: серверы Яндекса не используются вообще.
++        # Никаких исходящих запросов: все вызоверы отдают локальный fallback/шаблон.
++        raise ConnectionError("upstream fetch disabled by owner policy (no Yandex servers)")
+         last = (None, b"")
+         for attempt in range(1, RETRY_ATTEMPTS + 1):
+             conn = PinnedHTTPS(host, ip, timeout=UPSTREAM_TIMEOUT)
+@@ -1093,7 +1154,7 @@ def local_ips():
+     if primary and primary not in ips:
+         ips.insert(0, primary)
+     return ips or [LOCAL_IP]
+-DNS_UPSTREAMS = [("1.1.1.1", 53), ("8.8.8.8", 53), ("77.88.8.8", 53)]
++DNS_UPSTREAMS = [("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)]  # 77.88.8.8 (Яндекс DNS) убран по запрету владельца
+ 
+ 
+ def _dns_qname(data):
